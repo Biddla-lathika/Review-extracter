@@ -28,10 +28,13 @@ def extract_reviews(page, max_reviews: int):
 
     no_new_rounds = 0
     previous_count = 0
+    scroll_rounds_completed = 0
 
     print("Looking for review cards...")
 
     for scroll_number in range(1, 3001):
+
+        scroll_rounds_completed = scroll_number
 
         # Expand "More" buttons
         try:
@@ -76,14 +79,39 @@ def extract_reviews(page, max_reviews: int):
                 # Reviewer name
                 name = ""
 
-                try:
-                    name = card.locator(
-                        "a.d4r55"
-                    ).first.text_content(
-                        timeout=1000
-                    ) or ""
-                except Exception:
-                    pass
+                for reviewer_selector in (
+                    "a.d4r55",
+                    "div.d4r55",
+                    "[class*='d4r55']",
+                ):
+                    try:
+                        candidate = card.locator(
+                            reviewer_selector
+                        ).first.text_content(
+                            timeout=800
+                        ) or ""
+                        candidate = candidate.strip()
+                        if candidate:
+                            name = candidate
+                            break
+                    except Exception:
+                        continue
+
+                if not name:
+                    # Google's avatar button often carries the
+                    # name as "Photo of <name>".
+                    try:
+                        aria = card.locator(
+                            'button[aria-label*="Photo of"]'
+                        ).first.get_attribute(
+                            "aria-label", timeout=800
+                        )
+                        if aria:
+                            name = aria.replace(
+                                "Photo of", ""
+                            ).strip()
+                    except Exception:
+                        pass
 
                 # Rating
                 rating = None
@@ -170,59 +198,105 @@ def extract_reviews(page, max_reviews: int):
 
         previous_count = current_count
 
-        if no_new_rounds >= 15:
+        if no_new_rounds >= 20:
             print(
                 "No new reviews detected. "
                 "Stopping."
             )
             break
 
-        # Find scrollable containers
+        # Scroll the reviews panel. Instead of guessing which
+        # element on the page is "the big scrollable one" (which
+        # can easily grab the wrong container — the sidebar, the
+        # map, etc.), walk up from an actual review card to find
+        # its real scrollable ancestor. That's guaranteed to be
+        # the reviews list itself.
         try:
 
             scroll_result = page.evaluate(
                 """
                 () => {
 
-                    const elements =
-                        Array.from(document.querySelectorAll('*'));
+                    const card = document.querySelector(
+                        'div[data-review-id], div.jftiEf'
+                    );
 
-                    const candidates = elements.filter(el => {
+                    if (!card) {
+                        return false;
+                    }
+
+                    let el = card.parentElement;
+
+                    while (el && el !== document.body) {
 
                         const style =
                             window.getComputedStyle(el);
 
-                        return (
+                        if (
                             (style.overflowY === 'auto' ||
                              style.overflowY === 'scroll') &&
                             el.scrollHeight >
-                            el.clientHeight + 100
-                        );
-                    });
+                            el.clientHeight + 50
+                        ) {
+                            el.scrollTop = el.scrollHeight;
+                            return true;
+                        }
 
-                    if (!candidates.length) {
-                        return false;
+                        el = el.parentElement;
                     }
 
-                    const target =
-                        candidates
-                        .sort(
-                            (a, b) =>
-                                b.scrollHeight -
-                                a.scrollHeight
-                        )[0];
-
-                    target.scrollTop =
-                        target.scrollHeight;
-
-                    return true;
+                    return false;
                 }
                 """
             )
 
             if not scroll_result:
 
-                # Fallback
+                # Fallback: previous whole-page heuristic, in case
+                # no review card is present yet to anchor from.
+                scroll_result = page.evaluate(
+                    """
+                    () => {
+
+                        const elements =
+                            Array.from(document.querySelectorAll('*'));
+
+                        const candidates = elements.filter(el => {
+
+                            const style =
+                                window.getComputedStyle(el);
+
+                            return (
+                                (style.overflowY === 'auto' ||
+                                 style.overflowY === 'scroll') &&
+                                el.scrollHeight >
+                                el.clientHeight + 100
+                            );
+                        });
+
+                        if (!candidates.length) {
+                            return false;
+                        }
+
+                        const target =
+                            candidates
+                            .sort(
+                                (a, b) =>
+                                    b.scrollHeight -
+                                    a.scrollHeight
+                            )[0];
+
+                        target.scrollTop =
+                            target.scrollHeight;
+
+                        return true;
+                    }
+                    """
+                )
+
+            if not scroll_result:
+
+                # Last resort
                 page.mouse.wheel(
                     0,
                     5000
@@ -237,7 +311,7 @@ def extract_reviews(page, max_reviews: int):
 
         time.sleep(1.2)
 
-    return list(reviews.values())
+    return list(reviews.values()), scroll_rounds_completed
 
 
 def await_count(locator):
@@ -442,7 +516,7 @@ def scrape_google_maps(
                     "after opening the Reviews tab."
                 )
 
-            reviews = extract_reviews(
+            reviews, scroll_rounds_completed = extract_reviews(
                 page,
                 max_reviews
             )
@@ -457,6 +531,7 @@ def scrape_google_maps(
                     "consent_dialog_dismissed": consent_dismissed,
                     "reviews_tab_clicked": review_clicked,
                     "reviews_panel_loaded": reviews_panel_loaded,
+                    "scroll_rounds_completed": scroll_rounds_completed,
                 },
             }
 
