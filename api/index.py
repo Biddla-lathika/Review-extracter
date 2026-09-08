@@ -387,7 +387,7 @@ def health():
     }
 
 
-@app.post("/api/scrape-reviews")
+@app.post("/scrape-reviews")
 def scrape_reviews(request: ReviewRequest):
 
     if request.max_reviews < 1:
