@@ -1,41 +1,21 @@
-import os
-import re
-from typing import Optional
-
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, HttpUrl
-
-from browserbase import Browserbase
-from playwright.sync_api import sync_playwright
-
-
-app = FastAPI(
-    title="Google Maps Review Scraper API",
-    version="1.0.0"
-)
-
-
-class ReviewRequest(BaseModel):
-    url: HttpUrl
-    max_reviews: int = 500
-
-
 def extract_reviews(page, max_reviews: int):
-    """Collect reviews by scrolling the Google Maps reviews dialog."""
+    """Collect Google Maps reviews by scrolling the reviews panel."""
     reviews = {}
     stable_rounds = 0
     previous_count = 0
 
-    dialog = page.locator('div[role="dialog"]').last
-    review_cards = dialog.locator(
-        'div[data-review-id], div.jftiEf'
-    )
+    # Google Maps commonly uses this class for the reviews panel.
+    scroll_container = page.locator("div.m6QErb").last
+
+    if not scroll_container.count():
+        print("Reviews scroll container not found.")
+        return []
 
     for scroll_number in range(1, 2001):
 
-        # Expand visible "More" buttons.
+        # Expand visible More buttons.
         try:
-            more_buttons = dialog.locator(
+            more_buttons = page.locator(
                 'button:has-text("More")'
             )
 
@@ -47,6 +27,11 @@ def extract_reviews(page, max_reviews: int):
 
         except Exception:
             pass
+
+        # Google Maps review cards.
+        review_cards = page.locator(
+            'div[data-review-id], div.jftiEf'
+        )
 
         card_count = review_cards.count()
 
@@ -92,7 +77,7 @@ def extract_reviews(page, max_reviews: int):
                 try:
                     aria = (
                         card.locator(
-                            'span.kvMYJc, span[role="img"]'
+                            'span[role="img"]'
                         )
                         .first
                         .get_attribute("aria-label")
@@ -169,42 +154,23 @@ def extract_reviews(page, max_reviews: int):
         if current_count >= max_reviews:
             break
 
-        # Scroll the reviews container.
+        # Scroll the actual reviews container.
         try:
-            did_scroll = dialog.evaluate("""
-                dialog => {
-                    const all = [
-                        dialog,
-                        ...dialog.querySelectorAll('*')
-                    ];
+            did_scroll = scroll_container.evaluate("""
+                el => {
+                    const before = el.scrollTop;
 
-                    const candidates = all.filter(el => {
-                        const s = getComputedStyle(el);
-
-                        return /(auto|scroll)/.test(s.overflowY) &&
-                               el.scrollHeight > el.clientHeight + 20;
-                    });
-
-                    const target = candidates.sort(
-                        (a, b) =>
-                            b.scrollHeight - a.scrollHeight
-                    )[0];
-
-                    if (!target) return false;
-
-                    const before = target.scrollTop;
-
-                    target.scrollTop = Math.min(
-                        target.scrollTop +
-                        Math.max(700, target.clientHeight * 0.85),
-                        target.scrollHeight
+                    el.scrollTop = Math.min(
+                        el.scrollTop +
+                        Math.max(700, el.clientHeight * 0.85),
+                        el.scrollHeight
                     );
 
-                    target.dispatchEvent(
+                    el.dispatchEvent(
                         new Event("scroll", {bubbles: true})
                     );
 
-                    return target.scrollTop > before;
+                    return el.scrollTop > before;
                 }
             """)
 
@@ -221,176 +187,7 @@ def extract_reviews(page, max_reviews: int):
         previous_count = current_count
 
         if stable_rounds >= 12:
-            print(
-                "Reached the end of the reviews list."
-            )
+            print("Reached the end of the reviews list.")
             break
 
     return list(reviews.values())
-
-
-def scrape_google_maps(
-    url: str,
-    max_reviews: int
-):
-    api_key = os.getenv(
-        "BROWSERBASE_API_KEY"
-    )
-
-    if not api_key:
-        raise Exception(
-            "BROWSERBASE_API_KEY is not configured"
-        )
-
-    bb = Browserbase(
-        api_key=api_key
-    )
-
-    session = bb.sessions.create()
-
-    print(
-        f"Browserbase session: {session.id}"
-    )
-
-    with sync_playwright() as playwright:
-
-        browser = None
-
-        try:
-            browser = playwright.chromium.connect_over_cdp(
-                session.connect_url
-            )
-
-            context = browser.contexts[0]
-
-            page = (
-                context.pages[0]
-                if context.pages
-                else context.new_page()
-            )
-
-            print(
-                f"Opening: {url}"
-            )
-
-            page.goto(
-                url,
-                wait_until="domcontentloaded",
-                timeout=60000
-            )
-
-            page.wait_for_timeout(5000)
-
-            # Try to click Reviews.
-            review_clicked = False
-
-            selectors = [
-                'button[aria-label*="Reviews"]',
-                'button:has-text("Reviews")',
-                '[role="button"]:has-text("Reviews")',
-            ]
-
-            for selector in selectors:
-
-                try:
-                    locator = page.locator(
-                        selector
-                    ).first
-
-                    if locator.is_visible(
-                        timeout=2000
-                    ):
-                        locator.click(
-                            timeout=5000
-                        )
-
-                        review_clicked = True
-
-                        print(
-                            "Reviews button clicked."
-                        )
-
-                        break
-
-                except Exception:
-                    pass
-
-            if not review_clicked:
-                print(
-                    "Could not explicitly click "
-                    "Reviews button."
-                )
-
-            page.wait_for_timeout(3000)
-
-            reviews = extract_reviews(
-                page,
-                max_reviews
-            )
-
-            return {
-                "success": True,
-                "session_id": session.id,
-                "source_url": url,
-                "review_count": len(reviews),
-                "reviews": reviews
-            }
-
-        finally:
-
-            if browser:
-                try:
-                    browser.close()
-                except Exception:
-                    pass
-
-
-@app.get("/")
-def home():
-    return {
-        "status": "ok",
-        "service": "Google Maps Review Scraper",
-        "message": "API is running"
-    }
-
-
-@app.get("/health")
-def health():
-    return {
-        "status": "healthy"
-    }
-
-
-@app.post("/scrape-reviews")
-def scrape_reviews(request: ReviewRequest):
-
-    if request.max_reviews < 1:
-        raise HTTPException(
-            status_code=400,
-            detail="max_reviews must be at least 1"
-        )
-
-    if request.max_reviews > 5000:
-        raise HTTPException(
-            status_code=400,
-            detail="max_reviews cannot exceed 5000"
-        )
-
-    try:
-        result = scrape_google_maps(
-            str(request.url),
-            request.max_reviews
-        )
-
-        return result
-
-    except Exception as e:
-
-        print(
-            f"Scraping error: {e}"
-        )
-
-        raise HTTPException(
-            status_code=500,
-            detail=str(e)
-        )
