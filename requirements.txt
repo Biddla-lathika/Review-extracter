@@ -1,0 +1,4 @@
+fastapi
+browserbase
+playwright
+python-dotenv
