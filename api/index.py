@@ -1,39 +1,63 @@
+import base64
+import os
+import re
+import time
+from typing import Optional
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, HttpUrl
+
+from browserbase import Browserbase
+from playwright.sync_api import sync_playwright
+
+
+app = FastAPI(
+    title="Google Maps Review Scraper API",
+    version="1.0.0"
+)
+
+
+class ReviewRequest(BaseModel):
+    url: HttpUrl
+    max_reviews: int = 500
+
+
 def extract_reviews(page, max_reviews: int):
-    """Collect Google Maps reviews by scrolling the reviews panel."""
+
     reviews = {}
-    stable_rounds = 0
+
+    no_new_rounds = 0
     previous_count = 0
 
-    # Google Maps commonly uses this class for the reviews panel.
-    scroll_container = page.locator("div.m6QErb").last
+    print("Looking for review cards...")
 
-    if not scroll_container.count():
-        print("Reviews scroll container not found.")
-        return []
+    for scroll_number in range(1, 3001):
 
-    for scroll_number in range(1, 2001):
-
-        # Expand visible More buttons.
+        # Expand "More" buttons
         try:
             more_buttons = page.locator(
                 'button:has-text("More")'
             )
 
-            for i in range(min(more_buttons.count(), 50)):
+            count = min(await_count(more_buttons), 30)
+
+            for i in range(count):
                 try:
-                    more_buttons.nth(i).click(timeout=800)
+                    more_buttons.nth(i).click(
+                        timeout=1000
+                    )
                 except Exception:
                     pass
 
         except Exception:
             pass
 
-        # Google Maps review cards.
-        review_cards = page.locator(
+        # Find review cards
+        cards = page.locator(
             'div[data-review-id], div.jftiEf'
         )
 
-        card_count = review_cards.count()
+        card_count = await_count(cards)
 
         for i in range(card_count):
 
@@ -41,57 +65,47 @@ def extract_reviews(page, max_reviews: int):
                 break
 
             try:
-                card = review_cards.nth(i)
 
-                review_id = card.get_attribute(
-                    "data-review-id"
+                card = cards.nth(i)
+
+                review_id = (
+                    card.get_attribute("data-review-id")
+                    or f"review-{i}-{scroll_number}"
                 )
-
-                if not review_id:
-                    review_id = f"fallback-{i}-{card_count}"
 
                 # Reviewer name
                 name = ""
 
-                for selector in [
-                    "a.d4r55",
-                    "div.d4r55"
-                ]:
-                    try:
-                        name = (
-                            card.locator(selector)
-                            .first
-                            .text_content(timeout=800)
-                            or ""
-                        ).strip()
-
-                        if name:
-                            break
-
-                    except Exception:
-                        pass
+                try:
+                    name = card.locator(
+                        "a.d4r55"
+                    ).first.text_content(
+                        timeout=1000
+                    ) or ""
+                except Exception:
+                    pass
 
                 # Rating
                 rating = None
 
                 try:
-                    aria = (
-                        card.locator(
-                            'span[role="img"]'
-                        )
-                        .first
-                        .get_attribute("aria-label")
+                    rating_element = card.locator(
+                        'span.kvMYJc'
+                    ).first
+
+                    aria = rating_element.get_attribute(
+                        "aria-label"
                     )
 
                     if aria:
                         match = re.search(
-                            r"([0-5](?:[.,][0-9])?)",
+                            r"([0-5](?:\.[0-9])?)",
                             aria
                         )
 
                         if match:
                             rating = float(
-                                match.group(1).replace(",", ".")
+                                match.group(1)
                             )
 
                 except Exception:
@@ -100,39 +114,34 @@ def extract_reviews(page, max_reviews: int):
                 # Review text
                 text = ""
 
-                for selector in [
-                    "span.wiI7pd",
-                    "div.MyEned"
-                ]:
-                    try:
-                        text = (
-                            card.locator(selector)
-                            .first
-                            .text_content(timeout=800)
-                            or ""
-                        ).strip()
-
-                        if text:
-                            break
-
-                    except Exception:
-                        pass
-
-                # Review date
-                date = ""
-
                 try:
-                    date = (
-                        card.locator("span.rsqaWe")
-                        .first
-                        .text_content(timeout=800)
-                        or ""
-                    ).strip()
-
+                    text = card.locator(
+                        "span.wiI7pd"
+                    ).first.text_content(
+                        timeout=1000
+                    ) or ""
                 except Exception:
                     pass
 
+                # Date
+                date = ""
+
+                try:
+                    date = card.locator(
+                        "span.rsqaWe"
+                    ).first.text_content(
+                        timeout=1000
+                    ) or ""
+                except Exception:
+                    pass
+
+                name = name.strip()
+                text = text.strip()
+                date = date.strip()
+
+                # Only save actual review data
                 if text or rating is not None:
+
                     reviews[review_id] = {
                         "review_id": review_id,
                         "reviewer": name,
@@ -154,40 +163,370 @@ def extract_reviews(page, max_reviews: int):
         if current_count >= max_reviews:
             break
 
-        # Scroll the actual reviews container.
-        try:
-            did_scroll = scroll_container.evaluate("""
-                el => {
-                    const before = el.scrollTop;
-
-                    el.scrollTop = Math.min(
-                        el.scrollTop +
-                        Math.max(700, el.clientHeight * 0.85),
-                        el.scrollHeight
-                    );
-
-                    el.dispatchEvent(
-                        new Event("scroll", {bubbles: true})
-                    );
-
-                    return el.scrollTop > before;
-                }
-            """)
-
-        except Exception:
-            did_scroll = False
-
-        page.wait_for_timeout(1800)
-
         if current_count == previous_count:
-            stable_rounds += 1
+            no_new_rounds += 1
         else:
-            stable_rounds = 0
+            no_new_rounds = 0
 
         previous_count = current_count
 
-        if stable_rounds >= 12:
-            print("Reached the end of the reviews list.")
+        if no_new_rounds >= 15:
+            print(
+                "No new reviews detected. "
+                "Stopping."
+            )
             break
 
+        # Find scrollable containers
+        try:
+
+            scroll_result = page.evaluate(
+                """
+                () => {
+
+                    const elements =
+                        Array.from(document.querySelectorAll('*'));
+
+                    const candidates = elements.filter(el => {
+
+                        const style =
+                            window.getComputedStyle(el);
+
+                        return (
+                            (style.overflowY === 'auto' ||
+                             style.overflowY === 'scroll') &&
+                            el.scrollHeight >
+                            el.clientHeight + 100
+                        );
+                    });
+
+                    if (!candidates.length) {
+                        return false;
+                    }
+
+                    const target =
+                        candidates
+                        .sort(
+                            (a, b) =>
+                                b.scrollHeight -
+                                a.scrollHeight
+                        )[0];
+
+                    target.scrollTop =
+                        target.scrollHeight;
+
+                    return true;
+                }
+                """
+            )
+
+            if not scroll_result:
+
+                # Fallback
+                page.mouse.wheel(
+                    0,
+                    5000
+                )
+
+        except Exception:
+
+            page.mouse.wheel(
+                0,
+                5000
+            )
+
+        time.sleep(1.2)
+
     return list(reviews.values())
+
+
+def await_count(locator):
+
+    try:
+        return locator.count()
+    except Exception:
+        return 0
+
+
+def dismiss_consent(page) -> bool:
+    """
+    Fresh Browserbase sessions have no Google cookies, so Google
+    very often shows the "Before you continue to Google"
+    consent interstitial instead of the real Maps page. If we
+    don't dismiss it, every later selector silently fails and
+    we return an empty result with success=True.
+    """
+
+    consent_selectors = [
+        'button:has-text("Accept all")',
+        'button:has-text("I agree")',
+        'button:has-text("Accept")',
+        'form[action*="consent"] button',
+        '[aria-label="Accept all"]',
+        '#L2AGLb',  # legacy Google "I agree" button id
+    ]
+
+    dismissed = False
+
+    # Give the interstitial a moment to render if it's coming.
+    page.wait_for_timeout(1500)
+
+    for selector in consent_selectors:
+        try:
+            locator = page.locator(selector).first
+            if locator.is_visible(timeout=1500):
+                locator.click(timeout=5000)
+                dismissed = True
+                print(f"Dismissed consent dialog via: {selector}")
+                break
+        except Exception:
+            continue
+
+    if dismissed:
+        # Consent click triggers a navigation back to Maps.
+        try:
+            page.wait_for_load_state(
+                "domcontentloaded", timeout=15000
+            )
+        except Exception:
+            pass
+        page.wait_for_timeout(2000)
+
+    return dismissed
+
+
+def capture_debug(page) -> dict:
+    """
+    Grab enough state to diagnose an empty scrape without having
+    to dig through the Browserbase session replay: current URL,
+    page title, and a screenshot (base64 JPEG, resized small).
+    """
+
+    debug = {}
+
+    try:
+        debug["final_url"] = page.url
+    except Exception:
+        debug["final_url"] = None
+
+    try:
+        debug["page_title"] = page.title()
+    except Exception:
+        debug["page_title"] = None
+
+    try:
+        screenshot_bytes = page.screenshot(type="jpeg", quality=40)
+        debug["screenshot_base64"] = base64.b64encode(
+            screenshot_bytes
+        ).decode("utf-8")
+    except Exception:
+        debug["screenshot_base64"] = None
+
+    return debug
+
+
+def scrape_google_maps(
+    url: str,
+    max_reviews: int
+):
+
+    api_key = os.getenv(
+        "BROWSERBASE_API_KEY"
+    )
+
+    if not api_key:
+        raise Exception(
+            "BROWSERBASE_API_KEY is not configured"
+        )
+
+    bb = Browserbase(
+        api_key=api_key
+    )
+
+    session = bb.sessions.create()
+
+    print(
+        f"Browserbase session: {session.id}"
+    )
+
+    with sync_playwright() as playwright:
+
+        browser = None
+
+        try:
+
+            browser = playwright.chromium.connect_over_cdp(
+                session.connect_url
+            )
+
+            context = browser.contexts[0]
+
+            page = (
+                context.pages[0]
+                if context.pages
+                else context.new_page()
+            )
+
+            print(
+                f"Opening: {url}"
+            )
+
+            page.goto(
+                url,
+                wait_until="domcontentloaded",
+                timeout=60000
+            )
+
+            page.wait_for_timeout(3000)
+
+            consent_dismissed = dismiss_consent(page)
+
+            # Try to click Reviews
+            review_clicked = False
+
+            selectors = [
+                'button[aria-label*="Reviews"]',
+                'button:has-text("Reviews")',
+                '[role="button"]:has-text("Reviews")',
+                'div[role="tab"]:has-text("Reviews")',
+            ]
+
+            for selector in selectors:
+
+                try:
+
+                    locator = page.locator(
+                        selector
+                    ).first
+
+                    if locator.is_visible(
+                        timeout=4000
+                    ):
+
+                        locator.click(
+                            timeout=5000
+                        )
+
+                        review_clicked = True
+
+                        print(
+                            "Reviews button clicked."
+                        )
+
+                        break
+
+                except Exception:
+                    pass
+
+            if not review_clicked:
+
+                print(
+                    "Could not explicitly click "
+                    "Reviews button."
+                )
+
+            # Wait for an actual review card to show up instead of
+            # a blind sleep — this fails fast and tells us clearly
+            # if the panel never opened.
+            reviews_panel_loaded = False
+
+            try:
+                page.wait_for_selector(
+                    'div[data-review-id], div.jftiEf',
+                    timeout=10000
+                )
+                reviews_panel_loaded = True
+            except Exception:
+                print(
+                    "No review cards appeared within 10s "
+                    "after opening the Reviews tab."
+                )
+
+            reviews = extract_reviews(
+                page,
+                max_reviews
+            )
+
+            result = {
+                "success": True,
+                "session_id": session.id,
+                "source_url": url,
+                "review_count": len(reviews),
+                "reviews": reviews,
+                "diagnostics": {
+                    "consent_dialog_dismissed": consent_dismissed,
+                    "reviews_tab_clicked": review_clicked,
+                    "reviews_panel_loaded": reviews_panel_loaded,
+                },
+            }
+
+            # If we came back empty, attach debug info (url, title,
+            # screenshot) so the caller can see what the browser
+            # actually rendered without digging through Browserbase.
+            if len(reviews) == 0:
+                result["diagnostics"]["debug"] = capture_debug(page)
+
+            return result
+
+        finally:
+
+            if browser:
+
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+
+
+@app.get("/")
+def home():
+
+    return {
+        "status": "ok",
+        "service": "Google Maps Review Scraper",
+        "message": "API is running"
+    }
+
+
+@app.get("/health")
+def health():
+
+    return {
+        "status": "healthy"
+    }
+
+
+@app.post("/api/scrape-reviews")
+def scrape_reviews(request: ReviewRequest):
+
+    if request.max_reviews < 1:
+        raise HTTPException(
+            status_code=400,
+            detail="max_reviews must be at least 1"
+        )
+
+    if request.max_reviews > 5000:
+        raise HTTPException(
+            status_code=400,
+            detail="max_reviews cannot exceed 5000"
+        )
+
+    try:
+
+        result = scrape_google_maps(
+            str(request.url),
+            request.max_reviews
+        )
+
+        return result
+
+    except Exception as e:
+
+        print(
+            f"Scraping error: {e}"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
