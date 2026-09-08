@@ -56,3 +56,9 @@ def scrape_review_endpoint(request: ReviewRequest):
             status_code=500,
             detail=str(e)
         )
+    
+@app.get("/health")
+def health():
+    return {
+        "status": "healthy"
+    }
