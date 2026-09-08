@@ -4,5 +4,27 @@
     "api/index.py": {
       "maxDuration": 300
     }
-  }
+  },
+  "rewrites": [
+    {
+      "source": "/docs",
+      "destination": "/api/docs"
+    },
+    {
+      "source": "/openapi.json",
+      "destination": "/api/openapi.json"
+    },
+    {
+      "source": "/health",
+      "destination": "/api/health"
+    },
+    {
+      "source": "/api/scrape-reviews",
+      "destination": "/api/api/scrape-reviews"
+    },
+    {
+      "source": "/",
+      "destination": "/api/"
+    }
+  ]
 }
