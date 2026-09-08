@@ -1,6 +1,5 @@
 import os
 import re
-import time
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
@@ -22,41 +21,34 @@ class ReviewRequest(BaseModel):
 
 
 def extract_reviews(page, max_reviews: int):
-
+    """Collect reviews by scrolling the Google Maps reviews dialog."""
     reviews = {}
-
-    no_new_rounds = 0
+    stable_rounds = 0
     previous_count = 0
 
-    print("Looking for review cards...")
+    dialog = page.locator('div[role="dialog"]').last
+    review_cards = dialog.locator(
+        'div[data-review-id], div.jftiEf'
+    )
 
-    for scroll_number in range(1, 3001):
+    for scroll_number in range(1, 2001):
 
-        # Expand "More" buttons
+        # Expand visible "More" buttons.
         try:
-            more_buttons = page.locator(
+            more_buttons = dialog.locator(
                 'button:has-text("More")'
             )
 
-            count = min(await_count(more_buttons), 30)
-
-            for i in range(count):
+            for i in range(min(more_buttons.count(), 50)):
                 try:
-                    more_buttons.nth(i).click(
-                        timeout=1000
-                    )
+                    more_buttons.nth(i).click(timeout=800)
                 except Exception:
                     pass
 
         except Exception:
             pass
 
-        # Find review cards
-        cards = page.locator(
-            'div[data-review-id], div.jftiEf'
-        )
-
-        card_count = await_count(cards)
+        card_count = review_cards.count()
 
         for i in range(card_count):
 
@@ -64,47 +56,57 @@ def extract_reviews(page, max_reviews: int):
                 break
 
             try:
+                card = review_cards.nth(i)
 
-                card = cards.nth(i)
-
-                review_id = (
-                    card.get_attribute("data-review-id")
-                    or f"review-{i}-{scroll_number}"
+                review_id = card.get_attribute(
+                    "data-review-id"
                 )
+
+                if not review_id:
+                    review_id = f"fallback-{i}-{card_count}"
 
                 # Reviewer name
                 name = ""
 
-                try:
-                    name = card.locator(
-                        "a.d4r55"
-                    ).first.text_content(
-                        timeout=1000
-                    ) or ""
-                except Exception:
-                    pass
+                for selector in [
+                    "a.d4r55",
+                    "div.d4r55"
+                ]:
+                    try:
+                        name = (
+                            card.locator(selector)
+                            .first
+                            .text_content(timeout=800)
+                            or ""
+                        ).strip()
+
+                        if name:
+                            break
+
+                    except Exception:
+                        pass
 
                 # Rating
                 rating = None
 
                 try:
-                    rating_element = card.locator(
-                        'span.kvMYJc'
-                    ).first
-
-                    aria = rating_element.get_attribute(
-                        "aria-label"
+                    aria = (
+                        card.locator(
+                            'span.kvMYJc, span[role="img"]'
+                        )
+                        .first
+                        .get_attribute("aria-label")
                     )
 
                     if aria:
                         match = re.search(
-                            r"([0-5](?:\.[0-9])?)",
+                            r"([0-5](?:[.,][0-9])?)",
                             aria
                         )
 
                         if match:
                             rating = float(
-                                match.group(1)
+                                match.group(1).replace(",", ".")
                             )
 
                 except Exception:
@@ -113,34 +115,39 @@ def extract_reviews(page, max_reviews: int):
                 # Review text
                 text = ""
 
-                try:
-                    text = card.locator(
-                        "span.wiI7pd"
-                    ).first.text_content(
-                        timeout=1000
-                    ) or ""
-                except Exception:
-                    pass
+                for selector in [
+                    "span.wiI7pd",
+                    "div.MyEned"
+                ]:
+                    try:
+                        text = (
+                            card.locator(selector)
+                            .first
+                            .text_content(timeout=800)
+                            or ""
+                        ).strip()
 
-                # Date
+                        if text:
+                            break
+
+                    except Exception:
+                        pass
+
+                # Review date
                 date = ""
 
                 try:
-                    date = card.locator(
-                        "span.rsqaWe"
-                    ).first.text_content(
-                        timeout=1000
-                    ) or ""
+                    date = (
+                        card.locator("span.rsqaWe")
+                        .first
+                        .text_content(timeout=800)
+                        or ""
+                    ).strip()
+
                 except Exception:
                     pass
 
-                name = name.strip()
-                text = text.strip()
-                date = date.strip()
-
-                # Only save actual review data
                 if text or rating is not None:
-
                     reviews[review_id] = {
                         "review_id": review_id,
                         "reviewer": name,
@@ -162,96 +169,70 @@ def extract_reviews(page, max_reviews: int):
         if current_count >= max_reviews:
             break
 
+        # Scroll the reviews container.
+        try:
+            did_scroll = dialog.evaluate("""
+                dialog => {
+                    const all = [
+                        dialog,
+                        ...dialog.querySelectorAll('*')
+                    ];
+
+                    const candidates = all.filter(el => {
+                        const s = getComputedStyle(el);
+
+                        return /(auto|scroll)/.test(s.overflowY) &&
+                               el.scrollHeight > el.clientHeight + 20;
+                    });
+
+                    const target = candidates.sort(
+                        (a, b) =>
+                            b.scrollHeight - a.scrollHeight
+                    )[0];
+
+                    if (!target) return false;
+
+                    const before = target.scrollTop;
+
+                    target.scrollTop = Math.min(
+                        target.scrollTop +
+                        Math.max(700, target.clientHeight * 0.85),
+                        target.scrollHeight
+                    );
+
+                    target.dispatchEvent(
+                        new Event("scroll", {bubbles: true})
+                    );
+
+                    return target.scrollTop > before;
+                }
+            """)
+
+        except Exception:
+            did_scroll = False
+
+        page.wait_for_timeout(1800)
+
         if current_count == previous_count:
-            no_new_rounds += 1
+            stable_rounds += 1
         else:
-            no_new_rounds = 0
+            stable_rounds = 0
 
         previous_count = current_count
 
-        if no_new_rounds >= 15:
+        if stable_rounds >= 12:
             print(
-                "No new reviews detected. "
-                "Stopping."
+                "Reached the end of the reviews list."
             )
             break
 
-        # Find scrollable containers
-        try:
-
-            scroll_result = page.evaluate(
-                """
-                () => {
-
-                    const elements =
-                        Array.from(document.querySelectorAll('*'));
-
-                    const candidates = elements.filter(el => {
-
-                        const style =
-                            window.getComputedStyle(el);
-
-                        return (
-                            (style.overflowY === 'auto' ||
-                             style.overflowY === 'scroll') &&
-                            el.scrollHeight >
-                            el.clientHeight + 100
-                        );
-                    });
-
-                    if (!candidates.length) {
-                        return false;
-                    }
-
-                    const target =
-                        candidates
-                        .sort(
-                            (a, b) =>
-                                b.scrollHeight -
-                                a.scrollHeight
-                        )[0];
-
-                    target.scrollTop =
-                        target.scrollHeight;
-
-                    return true;
-                }
-                """
-            )
-
-            if not scroll_result:
-
-                # Fallback
-                page.mouse.wheel(
-                    0,
-                    5000
-                )
-
-        except Exception:
-
-            page.mouse.wheel(
-                0,
-                5000
-            )
-
-        time.sleep(1.2)
-
     return list(reviews.values())
-
-
-def await_count(locator):
-
-    try:
-        return locator.count()
-    except Exception:
-        return 0
 
 
 def scrape_google_maps(
     url: str,
     max_reviews: int
 ):
-
     api_key = os.getenv(
         "BROWSERBASE_API_KEY"
     )
@@ -276,7 +257,6 @@ def scrape_google_maps(
         browser = None
 
         try:
-
             browser = playwright.chromium.connect_over_cdp(
                 session.connect_url
             )
@@ -301,7 +281,7 @@ def scrape_google_maps(
 
             page.wait_for_timeout(5000)
 
-            # Try to click Reviews
+            # Try to click Reviews.
             review_clicked = False
 
             selectors = [
@@ -313,7 +293,6 @@ def scrape_google_maps(
             for selector in selectors:
 
                 try:
-
                     locator = page.locator(
                         selector
                     ).first
@@ -321,7 +300,6 @@ def scrape_google_maps(
                     if locator.is_visible(
                         timeout=2000
                     ):
-
                         locator.click(
                             timeout=5000
                         )
@@ -338,7 +316,6 @@ def scrape_google_maps(
                     pass
 
             if not review_clicked:
-
                 print(
                     "Could not explicitly click "
                     "Reviews button."
@@ -362,7 +339,6 @@ def scrape_google_maps(
         finally:
 
             if browser:
-
                 try:
                     browser.close()
                 except Exception:
@@ -371,7 +347,6 @@ def scrape_google_maps(
 
 @app.get("/")
 def home():
-
     return {
         "status": "ok",
         "service": "Google Maps Review Scraper",
@@ -381,7 +356,6 @@ def home():
 
 @app.get("/health")
 def health():
-
     return {
         "status": "healthy"
     }
@@ -403,7 +377,6 @@ def scrape_reviews(request: ReviewRequest):
         )
 
     try:
-
         result = scrape_google_maps(
             str(request.url),
             request.max_reviews
